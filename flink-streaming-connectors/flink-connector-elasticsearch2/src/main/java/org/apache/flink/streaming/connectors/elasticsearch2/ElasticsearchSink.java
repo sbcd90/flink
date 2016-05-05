@@ -42,6 +42,8 @@ import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -86,6 +88,7 @@ public class ElasticsearchSink<T> extends RichSinkFunction<T>  {
 	public static final String CONFIG_KEY_BULK_FLUSH_MAX_ACTIONS = "bulk.flush.max.actions";
 	public static final String CONFIG_KEY_BULK_FLUSH_MAX_SIZE_MB = "bulk.flush.max.size.mb";
 	public static final String CONFIG_KEY_BULK_FLUSH_INTERVAL_MS = "bulk.flush.interval.ms";
+	public static final String CONFIG_KEY_CONNECTION_RETRIES = "conn.retries";
 
 	private static final long serialVersionUID = 1L;
 
@@ -106,6 +109,11 @@ public class ElasticsearchSink<T> extends RichSinkFunction<T>  {
 	 * The builder that is used to construct an {@link IndexRequest} from the incoming element.
 	 */
 	private final ElasticsearchSinkFunction<T> elasticsearchSinkFunction;
+
+	/**
+	 * This is set from inside the open method if connection retries are required.
+	 */
+	private transient int connectionRetries;
 
 	/**
 	 * The Client that was either retrieved from a Node or is a TransportClient.
@@ -178,6 +186,113 @@ public class ElasticsearchSink<T> extends RichSinkFunction<T>  {
 			LOG.info("Created Elasticsearch TransportClient {}", client);
 		}
 
+		buildBulkProcessorIndexer(client);
+	}
+
+	@Override
+	public void invoke(T element) {
+		//check if the connection to Elasticsearch nodes fail
+		if (hasFailure.get()) {
+			if (bulkProcessor != null) {
+				bulkProcessor.close();
+				bulkProcessor = null;
+			}
+
+			if (client != null) {
+				client.close();
+			}
+
+			final Timer timer = new Timer(true);
+			final T el = element;
+
+			//trying to reestablish the connection to Elasticsearch nodes with a fixed interval of 3 seconds.
+			TimerTask task = new TimerTask() {
+				@Override
+				public void run() {
+					if (reconnect()) {
+						buildBulkProcessorIndexer(client);
+
+						//connection reestablished. Calling the sink function.
+						elasticsearchSinkFunction.process(el, getRuntimeContext(), requestIndexer);
+
+						timer.cancel();
+					}
+				}
+			};
+
+			timer.scheduleAtFixedRate(task, 0, 3000);
+
+			try {
+				int sleepTime = connectionRetries > 0 ? 3000 * connectionRetries: 3000;
+				Thread.sleep(sleepTime);
+			} catch (InterruptedException e) {
+				throw new RuntimeException(e.getMessage());
+			}
+			timer.cancel();
+
+			// Throwing error even if the connection could not be open after retries.
+			ImmutableList<DiscoveryNode> nodes = ImmutableList.copyOf(((TransportClient) client).connectedNodes());
+			if (nodes.isEmpty()) {
+				throw new RuntimeException("Client is not connected to any Elasticsearch nodes!");
+			}
+		} else {
+			elasticsearchSinkFunction.process(element, getRuntimeContext(), requestIndexer);
+		}
+	}
+
+	@Override
+	public void close() {
+		if (bulkProcessor != null) {
+			bulkProcessor.close();
+			bulkProcessor = null;
+		}
+
+		if (client != null) {
+			client.close();
+		}
+
+		if (hasFailure.get()) {
+			Throwable cause = failureThrowable.get();
+			if (cause != null) {
+				throw new RuntimeException("An error occured in ElasticsearchSink.", cause);
+			} else {
+				throw new RuntimeException("An error occured in ElasticsearchSink.");
+			}
+		}
+
+	}
+
+	private boolean reconnect() {
+		List<TransportAddress> transportNodes;
+		transportNodes = new ArrayList<>(transportAddresses.size());
+
+		for (InetSocketAddress address: transportAddresses) {
+			transportNodes.add(new InetSocketTransportAddress(address));
+		}
+
+		Settings settings = Settings.settingsBuilder().put(userConfig).build();
+
+		TransportClient transportClient = TransportClient.builder().settings(settings).build();
+		for (TransportAddress transport: transportNodes) {
+			transportClient.addTransportAddress(transport);
+		}
+
+		// verify that we actually are connected to a cluster
+		ImmutableList<DiscoveryNode> nodes = ImmutableList.copyOf(transportClient.connectedNodes());
+		if (nodes.isEmpty()) {
+			LOG.info("Client is not connected to any Elasticsearch nodes!");
+			return false;
+		} else {
+			client = transportClient;
+
+			if (LOG.isInfoEnabled()) {
+				LOG.info("Reopened Elasticsearch TransportClient {}", client);
+			}
+			return true;
+		}
+	}
+
+	private void buildBulkProcessorIndexer(Client client) {
 		BulkProcessor.Builder bulkProcessorBuilder = BulkProcessor.builder(client, new BulkProcessor.Listener() {
 			@Override
 			public void beforeBulk(long executionId, BulkRequest request) {
@@ -216,42 +331,19 @@ public class ElasticsearchSink<T> extends RichSinkFunction<T>  {
 
 		if (params.has(CONFIG_KEY_BULK_FLUSH_MAX_SIZE_MB)) {
 			bulkProcessorBuilder.setBulkSize(new ByteSizeValue(params.getInt(
-					CONFIG_KEY_BULK_FLUSH_MAX_SIZE_MB), ByteSizeUnit.MB));
+				CONFIG_KEY_BULK_FLUSH_MAX_SIZE_MB), ByteSizeUnit.MB));
 		}
 
 		if (params.has(CONFIG_KEY_BULK_FLUSH_INTERVAL_MS)) {
 			bulkProcessorBuilder.setFlushInterval(TimeValue.timeValueMillis(params.getInt(CONFIG_KEY_BULK_FLUSH_INTERVAL_MS)));
 		}
 
+		if (params.has(CONFIG_KEY_CONNECTION_RETRIES)) {
+			this.connectionRetries = params.getInt(CONFIG_KEY_CONNECTION_RETRIES);
+		}
+
 		bulkProcessor = bulkProcessorBuilder.build();
 		requestIndexer = new BulkProcessorIndexer(bulkProcessor);
-	}
-
-	@Override
-	public void invoke(T element) {
-		elasticsearchSinkFunction.process(element, getRuntimeContext(), requestIndexer);
-	}
-
-	@Override
-	public void close() {
-		if (bulkProcessor != null) {
-			bulkProcessor.close();
-			bulkProcessor = null;
-		}
-
-		if (client != null) {
-			client.close();
-		}
-
-		if (hasFailure.get()) {
-			Throwable cause = failureThrowable.get();
-			if (cause != null) {
-				throw new RuntimeException("An error occured in ElasticsearchSink.", cause);
-			} else {
-				throw new RuntimeException("An error occured in ElasticsearchSink.");
-			}
-		}
-
 	}
 
 }
